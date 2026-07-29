@@ -1,0 +1,13 @@
+Le chart nginx-istio a été déployé.
+
+Vérifie les pods :
+  kubectl get pods -l app.kubernetes.io/instance={{ .Release.Name }}
+
+Vérifie la Gateway et la VirtualService Istio :
+  kubectl get gateway,virtualservice -l app.kubernetes.io/instance={{ .Release.Name }}
+
+Assure-toi que le namespace a le label d'injection Istio activé :
+  kubectl label namespace {{ .Release.Namespace }} istio-injection=enabled
+
+Accès (via l'IP externe du gateway ingress Istio, avec le Host configuré) :
+  curl -H "Host: {{ .Values.istio.host }}" http://<EXTERNAL-IP>/

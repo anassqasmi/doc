@@ -1,0 +1,26 @@
+replicaCount: 1
+
+image:
+  repository: nginx
+  tag: "1.27-alpine"
+  pullPolicy: IfNotPresent
+
+service:
+  port: 80
+  targetPort: 80
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: 200m
+    memory: 128Mi
+
+istio:
+  enabled: true
+  # Nom du gateway Istio déjà présent dans le cluster (ex: le gateway par défaut ingressgateway)
+  gatewaySelector:
+    istio: ingressgateway
+  # Nom de domaine (host) sur lequel exposer l'app
+  host: nginx.example.com

@@ -1,0 +1,6 @@
+apiVersion: v2
+name: nginx-istio
+description: Chart Helm basique pour déployer nginx exposé via Istio (Gateway + VirtualService)
+type: application
+version: 0.1.0
+appVersion: "1.27"
