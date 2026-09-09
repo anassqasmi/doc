@@ -1,0 +1,97 @@
+
+
+  # Always the same object type: empty lists when no bucket (no ternary vs {}).
+  gcsfuse_pod = {
+    extraVolumes = [
+      for v in [local.dags_gcs_volume] : v
+      if var.dags_bucket_name != ""
+    ]
+    extraVolumeMounts = [
+      for v in [local.dags_gcs_mount] : v
+      if var.dags_bucket_name != ""
+    ]
+    podAnnotations = var.dags_bucket_name == "" ? tomap({}) : tomap({ "gke-gcsfuse/volumes" = "true" })
+  }
+
+  image_parts = split(":", var.airflow_image)
+}
+
+resource "helm_release" "airflow" {
+  name            = var.airflow_release_name
+  chart           = "${path.module}/chart"
+  namespace       = var.namespace
+  timeout         = 900
+  force_update    = true
+  cleanup_on_fail = true
+  upgrade_install = true
+
+  values = [yamlencode({
+    executor   = "LocalExecutor"
+    images     = { airflow = { repository = local.image_parts[0], tag = local.image_parts[1] } }
+    postgresql = { enabled = false }
+    redis      = { enabled = false }
+    statsd     = { enabled = false }
+
+    data = { metadataSecretName = var.metadata_db_secret_name }
+
+    dags = { mountPath = var.dags_bucket_name != "" ? local.dags_mount_path : null }
+
+    config = {
+      api  = { base_url = local.base_url }
+      core = { auth_manager = "airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager" }
+    }
+
+    createUserJob      = { enabled = false, serviceAccount = local.existing_sa }
+    migrateDatabaseJob = { serviceAccount = local.existing_sa }
+
+    apiServer = merge(
+      {
+        args            = ["bash", "-c", "exec airflow api-server --proxy-headers"]
+        serviceAccount  = local.existing_sa
+        apiServerConfig = file("${path.module}/webserver_config.py")
+        env = [
+          { name = "FORWARDED_ALLOW_IPS", value = "*" },
+          { name = "OIDC_ISSUER_URL", value = var.oidc_issuer_url },
+          { name = "OIDC_CALLBACK_URL", value = local.callback_url },
+          { name = "OIDC_CLIENT_ID", valueFrom = { secretKeyRef = { name = var.oidc_secret_name, key = "client-id" } } },
+          { name = "OIDC_CLIENT_SECRET", valueFrom = { secretKeyRef = { name = var.oidc_secret_name, key = "client-secret" } } },
+        ]
+      },
+      local.gcsfuse_pod,
+    )
+
+    scheduler    = merge({ serviceAccount = local.existing_sa }, local.gcsfuse_pod)
+    dagProcessor = merge({ serviceAccount = local.existing_sa }, local.gcsfuse_pod)
+    triggerer    = merge({ serviceAccount = local.existing_sa }, local.gcsfuse_pod)
+  })]
+}
+
+resource "kubernetes_manifest" "virtual_service" {
+  manifest = {
+    apiVersion = "networking.istio.io/v1"
+    kind       = "VirtualService"
+    metadata = {
+      name      = var.airflow_release_name
+      namespace = var.namespace
+    }
+    spec = {
+      hosts    = [var.airflow_hostname]
+      gateways = [var.istio_gateway]
+      http     = local.vs_http
+    }
+  }
+
+  depends_on = [helm_release.airflow]
+}
+
+output "airflow_url" {
+  value = local.base_url
+}
+
+output "oidc_callback_url" {
+  value = local.callback_url
+}
+
+output "dags_mount_path" {
+  value = local.dags_mount_path
+}
