@@ -1,0 +1,234 @@
+# Entraînement du modèle de routage triptyque
+
+Pipeline ML déployée sur **Cloud Composer (Airflow)** : préparation des données, entraînement scikit-learn, journalisation **MLflow**, puis promotion éventuelle du modèle dans le Model Registry.
+
+## Prérequis
+
+- **Données déjà présentes dans la landing zone** (bucket / chemin Composer). Le DAG ne dépose pas le CSV : il le lit uniquement.
+- Variables Airflow configurées (voir [Configuration](#configuration-airflow)).
+- Paquets installés dans l’environnement Composer : `mlflow`, `scikit-learn`, `pandas`, `polars`, `pyarrow`, `openpyxl`, `matplotlib` (voir `requirements.txt`).
+- Serveur MLflow accessible depuis les workers Airflow.
+
+### Jeu de données attendu
+
+CSV avec au minimum les colonnes suivantes (après renommage éventuel) :
+
+| Colonne | Rôle |
+|---------|------|
+| `PYID` | Identifiant |
+| `texte_anonymise` → `demande` | Texte de la demande |
+| `Code theme` → `code_theme` | Feature catégorielle |
+| `Code sous theme` → `code_sous_theme` | Feature catégorielle |
+| `dernier_triptyque` | Cible (classe à prédire) |
+| `freq_group` | Filtre de fréquence (`rare` / `peu frequent` exclus) |
+
+Colonnes optionnelles pour les exports métier : `libelle_theme`, `libelle_sous_theme`.
+
+Chemin par défaut côté Composer : `/home/airflow/gcs/data/jeu_entrainement.csv` (surchargeable via la Variable `routage_data_path`).
+
+---
+
+## Structure du dépôt
+
+| Fichier | Rôle |
+|---------|------|
+| `dag_entrainement_routage.py` | DAG Airflow `entrainement_routage_triptyque` |
+| `stages.py` | Étapes `prepare` / `train` / `promote` |
+| `data.py` | Chargement CSV, filtre, split train/val/test |
+| `model.py` | Pipeline TF-IDF + OneHot + SGD ou LinearSVC |
+| `training.py` | Entraînement et logging MLflow |
+| `evaluation.py` | Métriques et graphiques |
+| `artifacts.py` | Artefacts journalisés dans le run |
+| `registry.py` | Enregistrement + alias `challenger` / `champion` |
+| `config.py` | Configuration centralisée |
+
+En déploiement, le package Python doit s’appeler **`routage_triptyque`** et être placé **à côté du DAG** dans le dossier `dags` de Composer (le DAG fait `from routage_triptyque...`).
+
+---
+
+## DAG Airflow : étapes
+
+DAG id : **`entrainement_routage_triptyque`**  
+Schedule : **manuel** (`schedule=None`). Tags : `ml`, `mlflow`, `routage`.
+
+```
+preparer_donnees → entrainer_modele → promouvoir_modele
+```
+
+### 1. `preparer_donnees`
+
+1. Charge le CSV depuis `routage_data_path`.
+2. Renomme les colonnes métier.
+3. Écarte les lignes dont `freq_group` est `rare` ou `peu frequent`.
+4. Découpe stratifié **70 % train / 15 % val / 15 % test**.
+5. Écrit dans un dossier de travail partagé :
+   - `splits.parquet`
+   - `df_kept.parquet`
+   - `data_stats.json`
+6. Retourne le chemin `work_dir` via XCom (seul petit texte échangé ; le volume reste sur disque).
+
+### 2. `entrainer_modele`
+
+1. Relit les splits depuis `work_dir`.
+2. Construit le pipeline (`sgd` ou `svc` selon le paramètre du run).
+3. Entraîne, évalue train / val / test.
+4. Journalise params, tags, métriques, artefacts et le modèle dans MLflow.
+5. Retourne `run_id`, `model_uri` et les métriques.
+
+Timeout d’exécution : 2 heures.
+
+### 3. `promouvoir_modele`
+
+1. Enregistre le modèle dans le registry (`routage-triptyque-classifier`).
+2. Pose l’alias **`challenger`**.
+3. Compare la métrique **`val_f1_weighted_filtered`** au champion actuel.
+4. Si meilleur (ou premier modèle) → alias **`champion`** ; sinon le champion reste inchangé.
+
+---
+
+## Comment lancer
+
+### Sur Composer (recommandé)
+
+1. Déposer le CSV dans la **landing zone** (ex. dossier `data` du bucket Composer).
+2. Vérifier les Variables Airflow (ci-dessous).
+3. Dans l’UI Airflow : déclencher le DAG **`entrainement_routage_triptyque`**.
+4. Au trigger, renseigner éventuellement :
+   - **`model_kind`** : `sgd` (défaut) ou `svc`
+   - **`note`** : texte libre stocké en tag MLflow
+
+### En local (étapes Python)
+
+```bash
+pip install -r requirements.txt
+export MLFLOW_TRACKING_URI=http://localhost:5000
+export DATA_PATH=/chemin/vers/jeu_entrainement.csv
+
+python -c "
+from routage_triptyque.config import Config
+from routage_triptyque.stages import prepare, train, promote
+
+cfg = Config(model_kind='sgd')
+work = '/tmp/routage_run'
+prepare(cfg, work)
+result = train(cfg, work, note='essai local')
+print(promote(cfg, result))
+"
+```
+
+Le package doit être importable sous le nom `routage_triptyque` (dossier du même nom ou `PYTHONPATH` adapté).
+
+---
+
+## Configuration Airflow
+
+| Variable | Description | Défaut |
+|----------|-------------|--------|
+| `mlflow_tracking_uri` | URL du serveur MLflow | *(obligatoire)* |
+| `routage_data_path` | Chemin du CSV d’entraînement | `/home/airflow/gcs/data/jeu_entrainement.csv` |
+| `routage_work_dir` | Racine des dossiers de travail par run | `/home/airflow/gcs/data/routage` |
+
+Params du DAG au déclenchement :
+
+| Param | Description |
+|-------|-------------|
+| `model_kind` | `sgd` ou `svc` |
+| `note` | Note libre → tag MLflow `note` |
+
+---
+
+## CI GitLab → GCS
+
+La CI GitLab **déploie le code** (DAG + package `routage_triptyque`) vers le bucket GCS de Composer (dossier `dags`). Elle **ne déploie pas les données**.
+
+Flux attendu :
+
+1. Push / merge sur la branche de déploiement.
+2. Pipeline GitLab : build éventuel, puis **copie du code** vers GCS (sync `gsutil` / équivalent vers le bucket Composer).
+3. Composer recharge les DAGs depuis GCS.
+4. Les **données** doivent déjà être dans la landing zone (`data/` ou chemin configuré dans `routage_data_path`) **avant** de lancer le DAG.
+
+> Sans CSV en landing zone, l’étape `preparer_donnees` échoue à la lecture du fichier.
+
+---
+
+## MLflow : ce qui est produit
+
+Expérience : **`routage-triptyque`**  
+Nom de run : `{model_kind}-{YYYYMMDD-HHMM}`  
+Modèle enregistré : **`routage-triptyque-classifier`**
+
+### Params journalisés
+
+| Param | Contenu |
+|-------|---------|
+| `model` | `sgd` ou `svc` |
+| `seed` | Graine de split / aléatoire |
+| `text_col` | Colonne texte (`demande`) |
+| `cat_cols` | Colonnes catégorielles |
+| `target_col` | Cible (`dernier_triptyque`) |
+| `excluded_freq_groups` | Groupes de fréquence exclus |
+| `holdout_frac` | Fraction holdout (0,30) |
+| `min_support` / `max_support` | Bornes pour métriques filtrées |
+| `tfidf__*` | Hyperparams TF-IDF (`max_features`, `ngram_range`, …) |
+| `clf__*` | Hyperparams du classifieur (SGD ou LinearSVC) |
+
+### Tags (traces de contexte)
+
+| Tag | Contenu |
+|-----|---------|
+| `dataset` | Nom du fichier CSV source |
+| `model_type` | Classe sklearn (`SGDClassifier` ou `LinearSVC`) |
+| `note` | Note libre du trigger Airflow (si renseignée) |
+
+### Métriques
+
+**Volumétrie (début de run)**  
+`n_rows_total`, `n_rows_kept`, `share_excluded`, `n_classes`, `n_train`, `n_val`, `n_test`, `training_time_s`
+
+**Par split** (`train_`, `val_`, `test_` en préfixe) :
+
+- Globales : `accuracy`, `recall_macro`, `f1_macro`, `f1_weighted`
+- Filtrées (classes avec support entre `min_support` et `max_support`) : `n_classes_filtered`, `coverage_filtered`, `precision_*_filtered`, `recall_*_filtered`, `f1_*_filtered`
+- Latence : `predict_time_s`, `predict_ms_per_sample`
+
+Métrique de **promotion champion** : `val_f1_weighted_filtered`.
+
+### Artefacts
+
+| Dossier MLflow | Fichiers |
+|----------------|----------|
+| `splits/` | `train_ids.csv`, `val_ids.csv`, `test_ids.csv` |
+| `reports/` | `val_per_class_metrics.csv`, `test_per_class_metrics.csv` |
+| `plots/` | `val_f1_top_classes.png`, `test_f1_top_classes.png` |
+| `metadata/` | `model_metadata.json` (features + classes) |
+| `exports/` | `triptyque_la_routage.xlsx`, `themes_sous_themes.json` (si libellés présents) |
+| `model/` | Modèle sklearn + signature + exemple d’entrée |
+
+### Registry
+
+- Alias **`challenger`** : toujours posé sur la nouvelle version.
+- Alias **`champion`** : mis à jour si la nouvelle version bat le champion sur `val_f1_weighted_filtered` (ou s’il n’y a pas encore de champion).
+
+---
+
+## Schéma rapide
+
+```
+Landing zone (CSV)
+        │
+        ▼
+┌───────────────────┐     CI GitLab      ┌─────────────────┐
+│  Bucket data GCS  │                    │  Bucket dags    │
+│  (données)        │                    │  (code DAG)     │
+└─────────┬─────────┘                    └────────┬────────┘
+          │                                       │
+          └──────────────┬────────────────────────┘
+                         ▼
+              Cloud Composer / Airflow
+         preparer → entrainer → promouvoir
+                         │
+                         ▼
+                      MLflow
+            (params, tags, metrics, artefacts, registry)
+```
